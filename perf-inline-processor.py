@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Resolve inline functions in perf record output using GSYM files.
+Resolve inline functions in perf record output using multiple symbolizer backends.
 
-Usage: perf_inline_resolver.py <perf.data>
+Usage: perf_inline_resolver.py <perf.data> [--symbolizer {gsym,addr2line}]
 
 This script streams perf script output and resolves inline functions on-the-fly
-using llvm-gsymutil, avoiding storing all samples in memory.
+using different symbolizer backends (llvm-gsymutil, llvm-addr2line), avoiding
+storing all samples in memory.
 """
 
 import argparse
@@ -14,8 +15,11 @@ import subprocess
 import sys
 import re
 import json
+import hashlib
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, Protocol
+from abc import ABC, abstractmethod
+from enum import Enum
 
 
 class StackFrame(TypedDict):
@@ -40,12 +44,527 @@ class Sample(TypedDict):
     pid: int | None
 
 
+class SymbolInfo(TypedDict):
+    """Standardized symbol information across all backends."""
+
+    name: str
+    file: str | None
+    line: int
+    offset: int | None
+    inlined: bool
+
+
+class SymbolizerBackend(ABC):
+    """Abstract base class for all symbolizer backends."""
+
+    def __init__(self, verbose: int = 0, **kwargs):
+        self.verbose = verbose
+        self.cache: dict[tuple[str, int], list[SymbolInfo]] = {}
+        self.cache_hits = 0
+        self.requests_made = 0
+
+    @abstractmethod
+    async def initialize(self) -> None:
+        """Initialize the symbolizer (start processes, etc.)"""
+        pass
+
+    @abstractmethod
+    async def cleanup(self) -> None:
+        """Clean up resources (close processes, etc.)"""
+        pass
+
+    @abstractmethod
+    def can_symbolize(self, dso_path: str) -> bool:
+        """Check if this backend can symbolize the given DSO"""
+        pass
+
+    @abstractmethod
+    async def resolve_address(self, dso_path: str, offset: int) -> list[SymbolInfo]:
+        """
+        Resolve an address to symbol information
+
+        Args:
+            dso_path: Path to the DSO/binary
+            offset: File offset within the DSO
+
+        Returns:
+            List of SymbolInfo in call order (outermost first)
+        """
+        pass
+
+    @property
+    @abstractmethod
+    def backend_name(self) -> str:
+        """Name of this symbolizer backend"""
+        pass
+
+    def get_stats(self) -> dict[str, int]:
+        """Get statistics for this backend"""
+        return {
+            "requests_made": self.requests_made,
+            "cache_hits": self.cache_hits,
+            "cache_entries": len(self.cache),
+        }
+
+
+class GSYMSymbolizer(SymbolizerBackend):
+    """Symbolizer backend using llvm-gsymutil and GSYM files"""
+
+    def __init__(self, verbose: int = 0, gsym_cache_dir: str | None = None, **kwargs):
+        super().__init__(verbose, **kwargs)
+        self.gsym_cache_dir = Path(gsym_cache_dir) if gsym_cache_dir else None
+        self.gsym_paths: dict[str, str | None] = {}
+        self.gsymutil_proc: asyncio.subprocess.Process | None = None
+        self.gsym_files_found = 0
+
+        if self.gsym_cache_dir:
+            self.gsym_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def backend_name(self) -> str:
+        return "gsym"
+
+    async def initialize(self) -> None:
+        """Start the llvm-gsymutil process"""
+        try:
+            self.gsymutil_proc = await asyncio.create_subprocess_exec(
+                "llvm-gsymutil",
+                "--addresses-from-stdin",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            if self.verbose >= 1:
+                print(f"[{self.backend_name}] Started llvm-gsymutil", file=sys.stderr)
+        except FileNotFoundError:
+            raise RuntimeError("llvm-gsymutil not found in PATH")
+
+    async def cleanup(self) -> None:
+        """Clean up the gsymutil process"""
+        if self.gsymutil_proc and self.gsymutil_proc.stdin:
+            self.gsymutil_proc.stdin.close()
+            await self.gsymutil_proc.wait()
+
+    def can_symbolize(self, dso_path: str) -> bool:
+        """Check if we can find or create a GSYM file for this DSO"""
+        gsym_path = self._get_gsym_path(dso_path)
+        return gsym_path is not None
+
+    def _get_gsym_path(self, dso_path: str) -> str | None:
+        """Get GSYM path for DSO, with caching and conversion"""
+        if dso_path in self.gsym_paths:
+            return self.gsym_paths[dso_path]
+
+        # Check for existing .gsym file
+        gsym_candidate = Path(dso_path).with_suffix(Path(dso_path).suffix + ".gsym")
+        if gsym_candidate.exists():
+            gsym_path = str(gsym_candidate)
+            self.gsym_paths[dso_path] = gsym_path
+            self.gsym_files_found += 1
+            if self.verbose >= 1:
+                print(f"[{self.backend_name}] Found GSYM: {dso_path}", file=sys.stderr)
+            return gsym_path
+
+        # Try to convert if cache directory is available
+        if self.gsym_cache_dir:
+            return self._try_convert_to_gsym(dso_path)
+
+        self.gsym_paths[dso_path] = None
+        return None
+
+    def _try_convert_to_gsym(self, dso_path: str) -> str | None:
+        """Try to convert DSO to GSYM format"""
+        dso_hash = hashlib.sha256(dso_path.encode()).hexdigest()[:16]
+        dso_name = Path(dso_path).name
+        cached_gsym = self.gsym_cache_dir / f"{dso_name}.{dso_hash}.gsym"
+
+        dso_file = Path(dso_path)
+        if cached_gsym.exists() and dso_file.exists():
+            if cached_gsym.stat().st_mtime >= dso_file.stat().st_mtime:
+                self.gsym_paths[dso_path] = str(cached_gsym)
+                self.gsym_files_found += 1
+                if self.verbose >= 1:
+                    print(
+                        f"[{self.backend_name}] Found cached GSYM: {cached_gsym}",
+                        file=sys.stderr,
+                    )
+                return str(cached_gsym)
+            else:
+                if self.verbose >= 1:
+                    print(
+                        f"[{self.backend_name}] Cached GSYM outdated, regenerating: {cached_gsym}",
+                        file=sys.stderr,
+                    )
+
+        # Convert DSO to GSYM
+        if dso_file.exists():
+            if self.verbose >= 1:
+                print(
+                    f"[{self.backend_name}] Converting {dso_path} to GSYM...",
+                    file=sys.stderr,
+                )
+
+            try:
+                result = subprocess.run(
+                    [
+                        "llvm-gsymutil",
+                        "--convert",
+                        dso_path,
+                        "--out-file",
+                        str(cached_gsym),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+
+                if result.returncode == 0 and cached_gsym.exists():
+                    self.gsym_paths[dso_path] = str(cached_gsym)
+                    self.gsym_files_found += 1
+                    if self.verbose >= 1:
+                        print(
+                            f"[{self.backend_name}] Successfully converted to GSYM: {cached_gsym}",
+                            file=sys.stderr,
+                        )
+                    return str(cached_gsym)
+                else:
+                    if self.verbose >= 1:
+                        print(
+                            f"[{self.backend_name}] Failed to convert {dso_path}: {result.stderr}",
+                            file=sys.stderr,
+                        )
+            except Exception as e:
+                if self.verbose >= 1:
+                    print(
+                        f"[{self.backend_name}] Error converting {dso_path}: {e}",
+                        file=sys.stderr,
+                    )
+
+        self.gsym_paths[dso_path] = None
+        return None
+
+    async def resolve_address(self, dso_path: str, offset: int) -> list[SymbolInfo]:
+        """Resolve address using GSYM"""
+        gsym_path = self._get_gsym_path(dso_path)
+        if not gsym_path:
+            return []
+
+        cache_key = (gsym_path, offset)
+        if cache_key in self.cache:
+            self.cache_hits += 1
+            return self.cache[cache_key]
+
+        if not self.gsymutil_proc:
+            return []
+
+        # Send request to gsymutil
+        line = f"0x{offset:x} {gsym_path}\n"
+        assert self.gsymutil_proc.stdin is not None
+        self.gsymutil_proc.stdin.write(line.encode("utf-8"))
+        await self.gsymutil_proc.stdin.drain()
+        self.requests_made += 1
+
+        if self.verbose >= 2:
+            print(
+                f"[{self.backend_name}] Sent request: 0x{offset:x} {gsym_path}",
+                file=sys.stderr,
+            )
+
+        # Parse response
+        symbols = await self._parse_gsymutil_response(offset)
+        self.cache[cache_key] = symbols
+        return symbols
+
+    async def _parse_gsymutil_response(self, expected_offset: int) -> list[SymbolInfo]:
+        """Parse gsymutil response into SymbolInfo objects"""
+        if not self.gsymutil_proc or not self.gsymutil_proc.stdout:
+            return []
+
+        symbols: list[SymbolInfo] = []
+
+        # Read the first line which should start with our address
+        first_line_bytes = await self.gsymutil_proc.stdout.readline()
+        if not first_line_bytes:
+            return symbols
+
+        first_line = first_line_bytes.decode("utf-8").rstrip()
+
+        # Verify this is a response for our address
+        match = re.match(r"0x([0-9a-f]+):\s+(.+)", first_line)
+        if not match:
+            return symbols
+
+        response_addr = int(match.group(1), 16)
+        content = match.group(2)
+
+        if response_addr != expected_offset:
+            print(
+                f"Warning: Expected response for 0x{expected_offset:x} but got 0x{response_addr:x}",
+                file=sys.stderr,
+            )
+
+        # Check if the content is an error message
+        if content.startswith("error:"):
+            if self.verbose >= 2:
+                print(
+                    f"[{self.backend_name}] gsymutil returned error: {content}",
+                    file=sys.stderr,
+                )
+            # Consume until blank line
+            while True:
+                line_bytes = await self.gsymutil_proc.stdout.readline()
+                if not line_bytes:
+                    break
+                line = line_bytes.decode("utf-8").rstrip()
+                if not line:
+                    break
+            return []
+
+        # Parse first frame
+        frame_info = self._parse_gsym_frame(content)
+        if frame_info:
+            symbols.append(frame_info)
+
+        # Read continuation lines until blank line
+        while True:
+            line_bytes = await self.gsymutil_proc.stdout.readline()
+            if not line_bytes:
+                break
+
+            line = line_bytes.decode("utf-8").rstrip()
+            if not line:
+                break
+
+            if line[0] != " ":
+                print(
+                    f"Warning: Found non-indented line without blank separator: {line}",
+                    file=sys.stderr,
+                )
+                break
+
+            frame_info = self._parse_gsym_frame(line.strip())
+            if frame_info:
+                symbols.append(frame_info)
+
+        if self.verbose >= 2:
+            print(
+                f"[{self.backend_name}] Received response for 0x{expected_offset:x}: {len(symbols)} frames",
+                file=sys.stderr,
+            )
+
+        return symbols
+
+    def _parse_gsym_frame(self, frame_text: str) -> SymbolInfo | None:
+        """Parse a single GSYM frame into SymbolInfo"""
+        # Example: "copy_nonoverlapping<u8> + 41 @ /path/file.rs:547 [inlined]"
+        match = re.match(
+            r"(.+?)\s+\+\s+(\d+)\s+@\s+(.+?):(\d+)(?:\s+\[inlined\])?", frame_text
+        )
+        if match:
+            name = match.group(1)
+            offset = int(match.group(2))
+            file = match.group(3)
+            line = int(match.group(4))
+            inlined = "[inlined]" in frame_text
+
+            return SymbolInfo(
+                name=name, file=file, line=line, offset=offset, inlined=inlined
+            )
+        return None
+
+
+class Addr2LineSymbolizer(SymbolizerBackend):
+    """Symbolizer backend using llvm-symbolizer with DWARF"""
+
+    def __init__(self, verbose: int = 0, **kwargs):
+        super().__init__(verbose, **kwargs)
+        self.addr2line_procs: dict[str, asyncio.subprocess.Process] = {}
+
+    @property
+    def backend_name(self) -> str:
+        return "addr2line"
+
+    async def initialize(self) -> None:
+        """Initialize - addr2line processes are created per-DSO as needed"""
+        pass
+
+    async def cleanup(self) -> None:
+        """Clean up all symbolizer processes"""
+        for proc in self.addr2line_procs.values():
+            if proc.stdin:
+                proc.stdin.close()
+                await proc.wait()
+        self.addr2line_procs.clear()
+
+    def can_symbolize(self, dso_path: str) -> bool:
+        """Always return True - we'll try the lookup and see if it works"""
+        return Path(dso_path).exists()
+
+    async def resolve_address(self, dso_path: str, offset: int) -> list[SymbolInfo]:
+        """Resolve address using addr2line"""
+        cache_key = (dso_path, offset)
+        if cache_key in self.cache:
+            self.cache_hits += 1
+            return self.cache[cache_key]
+
+        # Get or create symbolizer process for this DSO
+        proc = await self._get_symbolizer_process(dso_path)
+        if not proc:
+            return []
+
+        # Send address to addr2line
+        assert proc.stdin is not None
+        proc.stdin.write(f"0x{offset:x}\n".encode("utf-8"))
+        await proc.stdin.drain()
+        self.requests_made += 1
+
+        if self.verbose >= 2:
+            print(
+                f"[{self.backend_name}] Sent request: 0x{offset:x} to {dso_path}",
+                file=sys.stderr,
+            )
+
+        # Parse response
+        symbols = await self._parse_symbolizer_response(proc)
+
+        self.cache[cache_key] = symbols
+
+        if self.verbose >= 2:
+            print(
+                f"[{self.backend_name}] Received response for 0x{offset:x}: {len(symbols)} frames",
+                file=sys.stderr,
+            )
+
+        return symbols
+
+    async def _get_symbolizer_process(
+        self, dso_path: str
+    ) -> asyncio.subprocess.Process | None:
+        """Get or create llvm-symbolizer process for a specific DSO"""
+        if dso_path in self.addr2line_procs:
+            return self.addr2line_procs[dso_path]
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "llvm-symbolizer",
+                "--obj",
+                dso_path,
+                "--debuginfod",
+                "--functions",  # Show function names
+                "--inlines",  # Show inlined functions
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            self.addr2line_procs[dso_path] = proc
+            if self.verbose >= 2:
+                print(
+                    f"[{self.backend_name}] Started llvm-symbolizer process for {dso_path}",
+                    file=sys.stderr,
+                )
+            return proc
+        except FileNotFoundError:
+            if self.verbose >= 1:
+                print(
+                    f"[{self.backend_name}] llvm-symbolizer not found in PATH",
+                    file=sys.stderr,
+                )
+            return None
+
+    async def _parse_symbolizer_response(
+        self, proc: asyncio.subprocess.Process
+    ) -> list[SymbolInfo]:
+        """Parse llvm-symbolizer output - responses are separated by blank lines"""
+        symbols: list[SymbolInfo] = []
+
+        assert proc.stdout is not None
+
+        # Read function/location pairs until we hit a blank line
+        while True:
+            func_line_bytes = await proc.stdout.readline()
+            if not func_line_bytes:
+                break
+            func_name = func_line_bytes.decode("utf-8").strip()
+
+            # Empty line means end of this address's response
+            if not func_name:
+                break
+
+            # Read location line
+            location_line_bytes = await proc.stdout.readline()
+            if not location_line_bytes:
+                break
+            location = location_line_bytes.decode("utf-8").strip()
+
+            # If we get ?? for function name, no symbols available
+            if func_name == "??":
+                break
+
+            # Try to parse file:line:column (we ignore column)
+            if ":" in location and not location.startswith("??:"):
+                # Split on : but only take first two parts (file:line)
+                parts = location.split(":")
+                if len(parts) >= 2:
+                    file_path = parts[0]
+                    try:
+                        line_num = int(parts[1])
+                        symbols.append(
+                            SymbolInfo(
+                                name=func_name,
+                                file=file_path,
+                                line=line_num,
+                                offset=None,  # symbolizer doesn't provide offset within function
+                                inlined=len(symbols)
+                                > 0,  # First is main function, rest are inlined
+                            )
+                        )
+                        continue
+                    except ValueError:
+                        pass  # Fall through to function-only case
+
+            # Accept function name even without valid source location
+            symbols.append(
+                SymbolInfo(
+                    name=func_name,
+                    file=None,
+                    line=0,
+                    offset=None,
+                    inlined=len(symbols) > 0,
+                )
+            )
+
+        return symbols
+
+
+class SymbolizerType(Enum):
+    GSYM = "gsym"
+    ADDR2LINE = "addr2line"
+
+
+class SymbolizerFactory:
+    """Factory for creating symbolizer backends"""
+
+    @staticmethod
+    def create_symbolizer(
+        symbolizer_type: SymbolizerType, verbose: int = 0, **kwargs
+    ) -> SymbolizerBackend:
+        """Create a symbolizer backend of the specified type"""
+
+        if symbolizer_type == SymbolizerType.GSYM:
+            return GSYMSymbolizer(verbose=verbose, **kwargs)
+        elif symbolizer_type == SymbolizerType.ADDR2LINE:
+            return Addr2LineSymbolizer(verbose=verbose, **kwargs)
+        else:
+            raise ValueError(f"Unknown symbolizer type: {symbolizer_type}")
+
+
 class StreamingInlineResolver:
-    """Streams samples from perf and resolves inline functions on-the-fly."""
+    """Streams samples from perf and resolves inline functions using pluggable backends."""
 
     def __init__(
         self,
         perf_data_path: str,
+        symbolizer_type: SymbolizerType = SymbolizerType.ADDR2LINE,
         filter_pid: int | None = None,
         filter_comm: str | None = None,
         remappings: list[tuple[str, str]] | None = None,
@@ -54,97 +573,97 @@ class StreamingInlineResolver:
         json_output: bool = False,
         demangle: bool = False,
     ) -> None:
-        self.perf_data_path: str = perf_data_path
-        self.filter_pid: int | None = filter_pid
-        self.filter_comm: str | None = filter_comm
-        self.remappings: list[tuple[str, str]] = remappings or []
-        self.verbose: int = verbose
-        self.gsym_cache_dir: Path | None = (
-            Path(gsym_cache_dir) if gsym_cache_dir else None
+        self.perf_data_path = perf_data_path
+        self.filter_pid = filter_pid
+        self.filter_comm = filter_comm
+        self.remappings = remappings or []
+        self.verbose = verbose
+        self.json_output = json_output
+        self.demangle = demangle
+        self.sample_count = 0
+
+        # Create symbolizer backend
+        self.symbolizer = SymbolizerFactory.create_symbolizer(
+            symbolizer_type, verbose=verbose, gsym_cache_dir=gsym_cache_dir
         )
-        self.json_output: bool = json_output
-        self.demangle: bool = demangle
 
         # Demangling processes (if enabled)
         self.rustfilt_proc: asyncio.subprocess.Process | None = None
         self.cppfilt_proc: asyncio.subprocess.Process | None = None
 
-        # Create cache directory if specified
-        if self.gsym_cache_dir:
-            self.gsym_cache_dir.mkdir(parents=True, exist_ok=True)
-            if self.verbose >= 1:
-                print(
-                    f"Using GSYM cache directory: {self.gsym_cache_dir}",
-                    file=sys.stderr,
-                )
-
-        self.sample_count: int = 0
-
-        # Memoization cache: (gsym_path, file_offset) -> inline frames
-        self.inline_cache: dict[tuple[str, int], list[str]] = {}
-
-        # Track which DSOs have GSYM files
-        self.gsym_paths: dict[str, str | None] = {}  # dso_path -> gsym_path (or None)
-
-        # Statistics
-        self.gsymutil_requests: int = 0
-        self.cache_hits: int = 0
-        self.gsym_files_found: int = 0
-
     async def run(self) -> None:
         """Main processing loop."""
         if self.verbose >= 1:
-            print("Starting llvm-gsymutil process...", file=sys.stderr)
+            print(
+                f"Using symbolizer backend: {self.symbolizer.backend_name}",
+                file=sys.stderr,
+            )
 
-        # Start llvm-gsymutil process
+        # Initialize symbolizer
+        await self.symbolizer.initialize()
+
         try:
-            gsymutil_proc = await asyncio.create_subprocess_exec(
-                "llvm-gsymutil",
-                "--addresses-from-stdin",
+            # Start demangling processes if requested
+            if self.demangle:
+                await self._start_demangling_processes()
+
+            # Process perf output
+            await self._process_perf_output()
+
+        finally:
+            # Clean up
+            await self.symbolizer.cleanup()
+            await self._cleanup_demangling_processes()
+
+        # Print statistics
+        self._print_statistics()
+
+    async def _start_demangling_processes(self) -> None:
+        """Start demangling processes if requested"""
+        try:
+            self.rustfilt_proc = await asyncio.create_subprocess_exec(
+                "rustfilt",
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             if self.verbose >= 1:
-                print("llvm-gsymutil started successfully", file=sys.stderr)
+                print("rustfilt started successfully", file=sys.stderr)
         except FileNotFoundError:
-            print("Error: llvm-gsymutil not found in PATH", file=sys.stderr)
-            sys.exit(1)
-
-        # Start demangling processes if requested
-        if self.demangle:
-            try:
-                self.rustfilt_proc = await asyncio.create_subprocess_exec(
-                    "rustfilt",
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+            if self.verbose >= 1:
+                print(
+                    "Warning: rustfilt not found, skipping Rust demangling",
+                    file=sys.stderr,
                 )
-                if self.verbose >= 1:
-                    print("rustfilt started successfully", file=sys.stderr)
-            except FileNotFoundError:
-                if self.verbose >= 1:
-                    print(
-                        "Warning: rustfilt not found, skipping Rust demangling",
-                        file=sys.stderr,
-                    )
 
-            try:
-                self.cppfilt_proc = await asyncio.create_subprocess_exec(
-                    "c++filt",
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+        try:
+            self.cppfilt_proc = await asyncio.create_subprocess_exec(
+                "c++filt",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            if self.verbose >= 1:
+                print("c++filt started successfully", file=sys.stderr)
+        except FileNotFoundError:
+            if self.verbose >= 1:
+                print(
+                    "Warning: c++filt not found, skipping C++ demangling",
+                    file=sys.stderr,
                 )
-                if self.verbose >= 1:
-                    print("c++filt started successfully", file=sys.stderr)
-            except FileNotFoundError:
-                if self.verbose >= 1:
-                    print(
-                        "Warning: c++filt not found, skipping C++ demangling",
-                        file=sys.stderr,
-                    )
 
+    async def _cleanup_demangling_processes(self) -> None:
+        """Clean up demangling processes"""
+        if self.rustfilt_proc and self.rustfilt_proc.stdin:
+            self.rustfilt_proc.stdin.close()
+            await self.rustfilt_proc.wait()
+
+        if self.cppfilt_proc and self.cppfilt_proc.stdin:
+            self.cppfilt_proc.stdin.close()
+            await self.cppfilt_proc.wait()
+
+    async def _process_perf_output(self) -> None:
+        """Process perf script output line by line"""
         if self.verbose >= 1:
             print(f"Starting perf script on {self.perf_data_path}...", file=sys.stderr)
 
@@ -177,57 +696,45 @@ class StreamingInlineResolver:
 
         assert perf_proc.stdout is not None
         async for line in perf_proc.stdout:
-            line = line.decode("utf-8").rstrip()
+            line_str = line.decode("utf-8").rstrip()
 
-            if not line:
+            if not line_str:
                 # End of sample - blank line separator
+                if current_sample is not None and not self.json_output:
+                    print()  # Blank line after sample
                 current_sample = None
-            elif line.startswith("\t"):
+            elif line_str.startswith("\t"):
                 # Stack frame (indented with tab)
-                # Only process if we're tracking this sample
                 if current_sample is not None:
-                    frame = self._parse_stack_frame(line.strip())
+                    frame = self._parse_stack_frame(line_str.strip())
                     if frame:
-                        # Resolve and output this frame immediately
-                        await self._resolve_and_output_frame(
-                            frame, current_sample, gsymutil_proc
-                        )
+                        await self._resolve_and_output_frame(frame, current_sample)
             else:
-                # Sample header - this is the start of a new sample
-                header = self._parse_sample_header(line)
+                # Sample header
+                header = self._parse_sample_header(line_str)
                 if header and self._should_include_sample_header(header):
-                    # This is a sample we want to track
                     self.sample_count += 1
                     current_sample = Sample(
                         stack=[], comm=header["comm"], pid=header["pid"]
                     )
 
-                    comm = header["comm"]
-                    pid = header["pid"]
-
                     if not self.json_output:
-                        print(f"Sample {self.sample_count}: {comm} (PID {pid})")
+                        print(
+                            f"Sample {self.sample_count}: {header['comm']} (PID {header['pid']})"
+                        )
 
                     if self.verbose >= 2:
                         print(
-                            f"[VERBOSE] Processing sample {self.sample_count}: {comm} (PID {pid})",
+                            f"[VERBOSE] Processing sample {self.sample_count}: {header['comm']} (PID {header['pid']})",
                             file=sys.stderr,
                         )
                 else:
-                    # Sample we don't care about - set to None to skip frames
                     current_sample = None
 
-        # Don't forget the last sample
-        if current_sample is not None and not self.json_output:
-            # End the last sample with a blank line
-            print()
-
-        # Clean up
-        if self.verbose >= 1:
-            print("Waiting for perf script to complete...", file=sys.stderr)
+        # Wait for perf script to complete
         perf_return = await perf_proc.wait()
 
-        # Check for errors in perf stderr
+        # Check for errors
         if perf_proc.stderr:
             perf_stderr = await perf_proc.stderr.read()
             if perf_stderr:
@@ -241,35 +748,6 @@ class StreamingInlineResolver:
                 f"Warning: perf script exited with code {perf_return}", file=sys.stderr
             )
 
-        if self.verbose >= 1:
-            print("Closing llvm-gsymutil...", file=sys.stderr)
-
-        assert gsymutil_proc.stdin is not None
-        gsymutil_proc.stdin.close()
-        await gsymutil_proc.wait()
-
-        # Close demangling processes
-        if self.rustfilt_proc and self.rustfilt_proc.stdin:
-            self.rustfilt_proc.stdin.close()
-            await self.rustfilt_proc.wait()
-
-        if self.cppfilt_proc and self.cppfilt_proc.stdin:
-            self.cppfilt_proc.stdin.close()
-            await self.cppfilt_proc.wait()
-
-        # Print statistics
-        print(f"\n=== Statistics ===", file=sys.stderr)
-        print(f"Processed {self.sample_count} samples", file=sys.stderr)
-        print(f"GSYM files found: {self.gsym_files_found}", file=sys.stderr)
-        print(f"Cache entries: {len(self.inline_cache)}", file=sys.stderr)
-        print(f"gsymutil requests sent: {self.gsymutil_requests}", file=sys.stderr)
-        print(f"Cache hits: {self.cache_hits}", file=sys.stderr)
-        if self.gsymutil_requests + self.cache_hits > 0:
-            cache_hit_rate = (
-                100 * self.cache_hits / (self.gsymutil_requests + self.cache_hits)
-            )
-            print(f"Cache hit rate: {cache_hit_rate:.1f}%", file=sys.stderr)
-
     def _should_include_sample_header(self, header: SampleHeader) -> bool:
         """Check if sample header matches filters."""
         if self.filter_pid is not None and header["pid"] != self.filter_pid:
@@ -279,15 +757,112 @@ class StreamingInlineResolver:
         return True
 
     def _parse_sample_header(self, line: str) -> SampleHeader | None:
-        """Parse a sample header line to extract comm and pid.
-
-        Format: "comm pid" (no tid when using -F comm,pid,...)
-        Example: "rustc 540166"
-        """
+        """Parse a sample header line to extract comm and pid."""
         match = re.match(r"(\S+)\s+(\d+)", line)
         if match:
             return SampleHeader(comm=match.group(1), pid=int(match.group(2)))
         return None
+
+    def _parse_stack_frame(self, line: str) -> StackFrame | None:
+        """Parse a stack frame line."""
+        # Match: address (path+offset)
+        match = re.match(r"([0-9a-f]+)\s+\((.+?)\+0x([0-9a-f]+)\)", line)
+        if match:
+            offset = int(match.group(3), 16)
+            dso = match.group(2)
+            return StackFrame(offset=offset, dso=dso)
+
+        # Handle [unknown] or other special cases
+        match = re.match(r"([0-9a-f]+)\s+\(\[unknown\]\)", line)
+        if match:
+            return None
+
+        return None
+
+    async def _resolve_and_output_frame(
+        self, frame: StackFrame, sample: Sample
+    ) -> None:
+        """Resolve a single frame and output it immediately."""
+        offset = frame["offset"]
+        dso = frame["dso"]
+
+        if self.verbose >= 2:
+            print(f"[VERBOSE]   Frame: offset=0x{offset:x} dso={dso}", file=sys.stderr)
+
+        # Resolve using the symbolizer backend
+        symbols = await self.symbolizer.resolve_address(dso, offset)
+
+        # Apply remappings
+        for symbol in symbols:
+            for old, new in self.remappings:
+                symbol["file"] = symbol["file"].replace(old, new)
+
+        # Output based on format
+        if self.json_output:
+            await self._output_json(frame, sample, symbols)
+        else:
+            await self._output_text(frame, symbols)
+
+    async def _output_json(
+        self, frame: StackFrame, sample: Sample, symbols: list[SymbolInfo]
+    ) -> None:
+        """Output frame in JSON format"""
+        frames_json = []
+        for symbol in symbols:
+            name = (
+                await self._demangle_symbol(symbol["name"])
+                if self.demangle
+                else symbol["name"]
+            )
+            frames_json.append(
+                {"name": name, "file": symbol["file"], "line": symbol["line"]}
+            )
+
+        record = {
+            "sample": self.sample_count,
+            "comm": sample["comm"],
+            "pid": sample["pid"],
+            "offset": f"0x{frame['offset']:x}",
+            "dso": frame["dso"],
+            "frames": frames_json if frames_json else None,
+        }
+        print(json.dumps(record))
+
+    async def _output_text(self, frame: StackFrame, symbols: list[SymbolInfo]) -> None:
+        """Output frame in text format"""
+        if symbols:
+            # Print first frame with address
+            first_symbol = symbols[0]
+            name = (
+                await self._demangle_symbol(first_symbol["name"])
+                if self.demangle
+                else first_symbol["name"]
+            )
+
+            if first_symbol["offset"] is not None:
+                first_line = f"{name} + {first_symbol['offset']} @ {first_symbol['file']}:{first_symbol['line']}"
+            else:
+                first_line = f"{name} @ {first_symbol['file']}:{first_symbol['line']}"
+
+            print(f"    0x{frame['offset']:x}: {first_line}")
+
+            # Print remaining frames indented
+            for symbol in symbols[1:]:
+                name = (
+                    await self._demangle_symbol(symbol["name"])
+                    if self.demangle
+                    else symbol["name"]
+                )
+
+                if symbol["offset"] is not None:
+                    frame_line = f"{name} + {symbol['offset']} @ {symbol['file']}:{symbol['line']}"
+                else:
+                    frame_line = f"{name} @ {symbol['file']}:{symbol['line']}"
+
+                print(f"              {frame_line}")
+        else:
+            # No symbols resolved
+            print(f"    0x{frame['offset']:x}:")
 
     async def _demangle_symbol(self, symbol: str) -> str:
         """Demangle a symbol name using rustfilt and c++filt asynchronously."""
@@ -324,411 +899,42 @@ class StreamingInlineResolver:
 
         return result
 
-    def _parse_stack_frame(self, line: str) -> StackFrame | None:
-        """Parse a stack frame line.
+    def _print_statistics(self) -> None:
+        """Print processing statistics"""
+        print(f"\n=== Statistics ===", file=sys.stderr)
+        print(f"Processed {self.sample_count} samples", file=sys.stderr)
 
-        Format: "address (dso_path+offset)"
-        Example: "7faa06292411 (/usr/lib64/ld-linux-x86-64.so.2+0x24411)"
-        """
-        # Match: address (path+offset) or address ([unknown])
-        match = re.match(r"([0-9a-f]+)\s+\((.+?)\+0x([0-9a-f]+)\)", line)
-        if match:
-            # Ignore the runtime address, use the offset
-            offset = int(match.group(3), 16)
-            dso = match.group(2)
-            return StackFrame(offset=offset, dso=dso)
+        backend_stats = self.symbolizer.get_stats()
+        print(f"Symbolizer backend: {self.symbolizer.backend_name}", file=sys.stderr)
+        print(f"Symbolizer requests: {backend_stats['requests_made']}", file=sys.stderr)
+        print(f"Cache hits: {backend_stats['cache_hits']}", file=sys.stderr)
+        print(f"Cache entries: {backend_stats['cache_entries']}", file=sys.stderr)
 
-        # Handle [unknown] or other special cases
-        match = re.match(r"([0-9a-f]+)\s+\(\[unknown\]\)", line)
-        if match:
-            # Skip unknown frames
-            return None
-
-        return None
-
-    def _get_gsym_path(self, dso: str) -> str | None:
-        """Get the GSYM path for a DSO, with caching and optional conversion."""
-        if dso in self.gsym_paths:
-            return self.gsym_paths[dso]
-
-        # First, check for .gsym file next to the DSO
-        gsym_candidate = Path(dso).with_suffix(Path(dso).suffix + ".gsym")
-        if gsym_candidate.exists():
-            gsym_path = str(gsym_candidate)
-            self.gsym_paths[dso] = gsym_path
-            self.gsym_files_found += 1
-            if self.verbose >= 1:
-                print(f"Found GSYM: {dso}", file=sys.stderr)
-            return gsym_path
-
-        # If cache directory is specified, check cache or try to convert
-        if self.gsym_cache_dir:
-            # Create a cache filename based on the DSO path
-            # Use the full path hash to avoid collisions
-            import hashlib
-
-            dso_hash = hashlib.sha256(dso.encode()).hexdigest()[:16]
-            dso_name = Path(dso).name
-            cached_gsym = self.gsym_cache_dir / f"{dso_name}.{dso_hash}.gsym"
-
-            # Check if cached GSYM exists and is newer than the DSO
-            dso_path = Path(dso)
-            if cached_gsym.exists() and dso_path.exists():
-                dso_mtime = dso_path.stat().st_mtime
-                cached_mtime = cached_gsym.stat().st_mtime
-
-                if cached_mtime >= dso_mtime:
-                    # Cache is valid
-                    gsym_path = str(cached_gsym)
-                    self.gsym_paths[dso] = gsym_path
-                    self.gsym_files_found += 1
-                    if self.verbose >= 1:
-                        print(f"Found cached GSYM: {cached_gsym}", file=sys.stderr)
-                    return gsym_path
-                else:
-                    if self.verbose >= 1:
-                        print(
-                            f"Cached GSYM is outdated (DSO modified), will regenerate: {cached_gsym}",
-                            file=sys.stderr,
-                        )
-
-            # Try to convert the DSO to GSYM
-            if dso_path.exists():
-                if self.verbose >= 1:
-                    print(f"Converting {dso} to GSYM...", file=sys.stderr)
-
-                try:
-                    result = subprocess.run(
-                        [
-                            "llvm-gsymutil",
-                            "--convert",
-                            dso,
-                            "--out-file",
-                            str(cached_gsym),
-                        ],
-                        capture_output=True,
-                        text=True,
-                        timeout=30,
-                    )
-
-                    if result.returncode == 0 and cached_gsym.exists():
-                        gsym_path = str(cached_gsym)
-                        self.gsym_paths[dso] = gsym_path
-                        self.gsym_files_found += 1
-                        if self.verbose >= 1:
-                            print(
-                                f"Successfully converted to GSYM: {cached_gsym}",
-                                file=sys.stderr,
-                            )
-                        return gsym_path
-                    else:
-                        if self.verbose >= 1:
-                            print(
-                                f"Failed to convert {dso}: {result.stderr}",
-                                file=sys.stderr,
-                            )
-                except Exception as e:
-                    if self.verbose >= 1:
-                        print(f"Error converting {dso}: {e}", file=sys.stderr)
-
-        # No GSYM file found or created
-        self.gsym_paths[dso] = None
-        return None
-
-    async def _resolve_and_output_frame(
-        self,
-        frame: StackFrame,
-        sample: Sample,
-        gsymutil_proc: asyncio.subprocess.Process,
-    ) -> None:
-        """Resolve a single frame and output it immediately."""
-        offset = frame["offset"]
-        dso = frame["dso"]
-
-        if self.verbose >= 2:
-            print(f"[VERBOSE]   Frame: offset=0x{offset:x} dso={dso}", file=sys.stderr)
-
-        # Check if this DSO has a GSYM file
-        gsym_path = self._get_gsym_path(dso)
-
-        # Collect resolved frames
-        resolved_frames: list[str] = []
-        resolved_frames_json: list[dict] = []
-
-        if gsym_path:
-            if self.verbose >= 2:
-                print(f"[VERBOSE]     Resolving via GSYM: {gsym_path}", file=sys.stderr)
-
-            # Check cache first
-            cache_key = (gsym_path, offset)
-
-            if cache_key in self.inline_cache:
-                # Cache hit
-                self.cache_hits += 1
-                inline_frames = self.inline_cache[cache_key]
-            else:
-                # Need to resolve
-                inline_frames = await self._resolve_single_address(
-                    offset, gsym_path, gsymutil_proc
-                )
-                self.inline_cache[cache_key] = inline_frames
-
-                if self.verbose >= 2:
-                    print(
-                        f"[VERBOSE] Resolved {len(inline_frames)} frames for 0x{offset:x}",
-                        file=sys.stderr,
-                    )
-                    if not inline_frames:
-                        print(
-                            f"[VERBOSE] No frames returned (likely error or not in GSYM)",
-                            file=sys.stderr,
-                        )
-
-            # Process frames for output
-            if self.verbose >= 2 and inline_frames:
-                print(
-                    f"[VERBOSE] Processing {len(inline_frames)} frames for output",
-                    file=sys.stderr,
-                )
-            for inline_frame in inline_frames:
-                # Skip error messages
-                if inline_frame.startswith("error:"):
-                    continue
-
-                # Apply remappings
-                remapped = inline_frame
-                for old, new in self.remappings:
-                    remapped = remapped.replace(old, new)
-                resolved_frames.append(remapped)
-
-                # Parse for JSON format: "name + offset @ file:line [inlined]"
-                # Example: "copy_nonoverlapping<u8> + 41 @ /path/file.rs:547 [inlined]"
-                # The [inlined] suffix is optional
-                match = re.match(
-                    r"(.+?)\s+\+\s+\d+\s+@\s+(.+?):(\d+)(?:\s+\[inlined\])?", remapped
-                )
-                if match:
-                    name = match.group(1)
-                    file = match.group(2)
-                    line = int(match.group(3))
-
-                    # Demangle the symbol name if requested
-                    demangled_name = await self._demangle_symbol(name)
-
-                    resolved_frames_json.append(
-                        {"name": demangled_name, "file": file, "line": line}
-                    )
-                else:
-                    # Couldn't parse - this might be an error message or malformed
-                    # Don't add it to the JSON output at all, just skip it
-                    if self.verbose >= 2:
-                        print(
-                            f"[VERBOSE] Skipping unparseable frame: {remapped}",
-                            file=sys.stderr,
-                        )
-                    continue
-
-        # Output based on format
-        if self.json_output:
-            # JSON output - only include frames if we successfully resolved them
-            record = {
-                "sample": self.sample_count,
-                "comm": sample["comm"],
-                "pid": sample["pid"],
-                "offset": f"0x{offset:x}",
-                "dso": dso,
-                "frames": resolved_frames_json if resolved_frames_json else None,
-            }
-            print(json.dumps(record))
-        else:
-            # Text output
-            if resolved_frames:
-                # Print first frame with address
-                first_frame = resolved_frames[0]
-                # Demangle for text output too
-                if self.demangle:
-                    # Extract and demangle just the symbol name
-                    match = re.match(r"(.+?)\s+\+\s+(\d+\s+@\s+.+)", first_frame)
-                    if match:
-                        name = match.group(1)
-                        rest = match.group(2)
-                        demangled = await self._demangle_symbol(name)
-                        first_frame = f"{demangled} + {rest}"
-
-                print(f"    0x{offset:x}: {first_frame}")
-
-                # Print remaining frames indented
-                for resolved_frame in resolved_frames[1:]:
-                    # Demangle for text output
-                    if self.demangle:
-                        match = re.match(r"(.+?)\s+\+\s+(\d+\s+@\s+.+)", resolved_frame)
-                        if match:
-                            name = match.group(1)
-                            rest = match.group(2)
-                            demangled = await self._demangle_symbol(name)
-                            resolved_frame = f"{demangled} + {rest}"
-
-                    print(f"              {resolved_frame}")
-            else:
-                # Resolution returned nothing - just show address
-                print(f"    0x{offset:x}:")
-
-        if not resolved_frames and self.verbose >= 2:
-            print(f"[VERBOSE]     No symbols resolved for {dso}", file=sys.stderr)
-
-    async def _resolve_single_address(
-        self, offset: int, gsym_path: str, gsymutil_proc: asyncio.subprocess.Process
-    ) -> list[str]:
-        """Resolve a single address via gsymutil.
-
-        Args:
-            offset: File offset in the DSO
-            gsym_path: Path to GSYM file
-            gsymutil_proc: The gsymutil process
-
-        Returns:
-            List of inline frame strings
-        """
-        assert gsymutil_proc.stdin is not None
-        assert gsymutil_proc.stdout is not None
-
-        # Check if process is still alive
-        if gsymutil_proc.returncode is not None:
+        if hasattr(self.symbolizer, "gsym_files_found"):
             print(
-                f"Error: gsymutil process died with return code {gsymutil_proc.returncode}",
-                file=sys.stderr,
-            )
-            if gsymutil_proc.stderr:
-                stderr_data = await gsymutil_proc.stderr.read()
-                if stderr_data:
-                    print(
-                        f"gsymutil stderr: {stderr_data.decode('utf-8')}",
-                        file=sys.stderr,
-                    )
-            return []
-
-        try:
-            # Send request
-            line = f"0x{offset:x} {gsym_path}\n"
-            gsymutil_proc.stdin.write(line.encode("utf-8"))
-            await gsymutil_proc.stdin.drain()
-            self.gsymutil_requests += 1
-
-            if self.verbose >= 2:
-                print(
-                    f"[VERBOSE] Sent request: 0x{offset:x} {gsym_path}", file=sys.stderr
-                )
-
-            # Read response
-            frames = await self._read_gsymutil_response_async(
-                gsymutil_proc.stdout, offset
+                f"GSYM files found: {self.symbolizer.gsym_files_found}", file=sys.stderr
             )
 
-            if self.verbose >= 2:
-                print(
-                    f"[VERBOSE] Received response for 0x{offset:x}: {len(frames)} frames",
-                    file=sys.stderr,
-                )
-
-            return frames
-        except (ConnectionResetError, BrokenPipeError) as e:
-            print(f"Error communicating with gsymutil: {e}", file=sys.stderr)
-            print(f"Last request was: 0x{offset:x} {gsym_path}", file=sys.stderr)
-            if gsymutil_proc.stderr:
-                stderr_data = await gsymutil_proc.stderr.read()
-                if stderr_data:
-                    print(
-                        f"gsymutil stderr: {stderr_data.decode('utf-8')}",
-                        file=sys.stderr,
-                    )
-            return []
-
-    async def _read_gsymutil_response_async(
-        self, stdout: asyncio.StreamReader, expected_offset: int
-    ) -> list[str]:
-        """Read one address worth of output from gsymutil asynchronously.
-
-        Args:
-            stdout: The stdout stream from gsymutil
-            expected_offset: The file offset we requested (for correlation)
-
-        Returns:
-            List of inline frame strings (empty list if error or not found)
-        """
-        frames: list[str] = []
-
-        # Read the first line which should start with our address (column 0)
-        first_line_bytes = await stdout.readline()
-        if not first_line_bytes:
-            return frames
-
-        first_line = first_line_bytes.decode("utf-8").rstrip()
-
-        # Verify this is a response for our address
-        # Format: "0xADDRESS: function + offset @ file:line [inlined]"
-        #     or: "0xADDRESS: error: ..."
-        match = re.match(r"0x([0-9a-f]+):\s+(.+)", first_line)
-        if not match:
-            return frames
-
-        response_addr = int(match.group(1), 16)
-        content = match.group(2)
-
-        if response_addr != expected_offset:
-            print(
-                f"Warning: Expected response for 0x{expected_offset:x} but got 0x{response_addr:x}",
-                file=sys.stderr,
-            )
-
-        # Check if the content is an error message
-        if content.startswith("error:"):
-            # This is an error - consume until blank line and return empty
-            if self.verbose >= 2:
-                print(f"[VERBOSE] gsymutil returned error: {content}", file=sys.stderr)
-            while True:
-                line_bytes = await stdout.readline()
-                if not line_bytes:
-                    break
-                line = line_bytes.decode("utf-8").rstrip()
-                if not line:
-                    break
-            return []
-
-        frames.append(content)
-
-        # Read continuation lines until we hit a blank line or a new address at column 0
-        while True:
-            line_bytes = await stdout.readline()
-            if not line_bytes:
-                # EOF
-                break
-
-            line = line_bytes.decode("utf-8").rstrip()
-
-            if not line:
-                # Blank line separator - end of this response
-                break
-
-            if line[0] != " ":
-                # New address at column 0 - we've read too far
-                # This shouldn't happen if there's a blank line separator
-                print(
-                    f"Warning: Found non-indented line without blank separator: {line}",
-                    file=sys.stderr,
-                )
-                break
-
-            # This is an indented continuation line
-            frames.append(line.strip())
-
-        return frames
+        total_requests = backend_stats["requests_made"] + backend_stats["cache_hits"]
+        if total_requests > 0:
+            cache_hit_rate = 100 * backend_stats["cache_hits"] / total_requests
+            print(f"Cache hit rate: {cache_hit_rate:.1f}%", file=sys.stderr)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Resolve inline functions in perf record output using GSYM files"
+        description="Resolve inline functions in perf record output using multiple symbolizer backends"
     )
     parser.add_argument("perf_data", help="Path to perf.data file")
+
+    # Symbolizer selection
+    parser.add_argument(
+        "--symbolizer",
+        choices=["gsym", "addr2line"],
+        default="addr2line",
+        help="Symbolizer backend to use (default: addr2line)",
+    )
+
     parser.add_argument(
         "--remap",
         action="append",
@@ -748,8 +954,7 @@ def main() -> None:
     parser.add_argument(
         "--gsym-cache",
         metavar="DIR",
-        help="Directory to cache generated GSYM files. If specified, will attempt to convert "
-        "binaries to GSYM format using llvm-gsymutil --convert",
+        help="Directory to cache generated GSYM files (only used with gsym backend)",
     )
     parser.add_argument(
         "--json",
@@ -776,9 +981,12 @@ def main() -> None:
             old, new = remap_str.split("=", 1)
             remappings.append((old, new))
 
+    symbolizer_type = SymbolizerType(args.symbolizer)
+
     # Run streaming processor
     resolver = StreamingInlineResolver(
         args.perf_data,
+        symbolizer_type=symbolizer_type,
         filter_pid=args.pid,
         filter_comm=args.comm,
         remappings=remappings,
