@@ -44,6 +44,15 @@ class Sample(TypedDict):
     pid: int | None
 
 
+class SampleOutput(TypedDict):
+    """Output format for a complete sample in JSON mode."""
+
+    sample: int
+    comm: str | None
+    pid: int | None
+    frames: list[dict]
+
+
 class SymbolInfo(TypedDict):
     """Standardized symbol information across all backends."""
 
@@ -698,19 +707,38 @@ class StreamingInlineResolver:
         async for line in perf_proc.stdout:
             line_str = line.decode("utf-8").rstrip()
 
+            if self.verbose >= 2:
+                print(f"[VERBOSE] Read line: {repr(line_str)}", file=sys.stderr)
+
             if not line_str:
                 # End of sample - blank line separator
-                if current_sample is not None and not self.json_output:
-                    print()  # Blank line after sample
+                if current_sample is not None:
+                    if self.verbose >= 2:
+                        print(
+                            f"[VERBOSE] End of sample {self.sample_count}, outputting {len(current_sample['stack'])} frames",
+                            file=sys.stderr,
+                        )
+                    await self._output_sample(current_sample)
                 current_sample = None
             elif line_str.startswith("\t"):
                 # Stack frame (indented with tab)
                 if current_sample is not None:
                     frame = self._parse_stack_frame(line_str.strip())
                     if frame:
-                        await self._resolve_and_output_frame(frame, current_sample)
+                        current_sample["stack"].append(frame)
+                        if self.verbose >= 2:
+                            print(f"[VERBOSE] Added frame: {frame}", file=sys.stderr)
             else:
                 # Sample header
+                # If we have a current sample, process it before starting new one
+                if current_sample is not None:
+                    if self.verbose >= 2:
+                        print(
+                            f"[VERBOSE] Starting new sample, outputting current sample {self.sample_count} with {len(current_sample['stack'])} frames",
+                            file=sys.stderr,
+                        )
+                    await self._output_sample(current_sample)
+
                 header = self._parse_sample_header(line_str)
                 if header and self._should_include_sample_header(header):
                     self.sample_count += 1
@@ -730,6 +758,15 @@ class StreamingInlineResolver:
                         )
                 else:
                     current_sample = None
+
+        # Process the last sample if we have one
+        if current_sample is not None:
+            if self.verbose >= 2:
+                print(
+                    f"[VERBOSE] EOF reached, outputting final sample {self.sample_count} with {len(current_sample['stack'])} frames",
+                    file=sys.stderr,
+                )
+            await self._output_sample(current_sample)
 
         # Wait for perf script to complete
         perf_return = await perf_proc.wait()
@@ -779,57 +816,91 @@ class StreamingInlineResolver:
 
         return None
 
-    async def _resolve_and_output_frame(
-        self, frame: StackFrame, sample: Sample
-    ) -> None:
-        """Resolve a single frame and output it immediately."""
-        offset = frame["offset"]
-        dso = frame["dso"]
-
-        if self.verbose >= 2:
-            print(f"[VERBOSE]   Frame: offset=0x{offset:x} dso={dso}", file=sys.stderr)
-
-        # Resolve using the symbolizer backend
-        symbols = await self.symbolizer.resolve_address(dso, offset)
-
-        # Apply remappings
-        for symbol in symbols:
-            for old, new in self.remappings:
-                symbol["file"] = symbol["file"].replace(old, new)
-
-        # Output based on format
+    async def _output_sample(self, sample: Sample) -> None:
+        """Output a complete sample with all resolved frames."""
         if self.json_output:
-            await self._output_json(frame, sample, symbols)
+            await self._output_sample_json(sample)
         else:
-            await self._output_text(frame, symbols)
+            await self._output_sample_text(sample)
+            print()  # Blank line after sample
 
-    async def _output_json(
-        self, frame: StackFrame, sample: Sample, symbols: list[SymbolInfo]
+    async def _output_sample_json(self, sample: Sample) -> None:
+        """Output sample in JSON format."""
+        frames = []
+
+        for frame in sample["stack"]:
+            offset = frame["offset"]
+            dso = frame["dso"]
+
+            if self.verbose >= 2:
+                print(
+                    f"[VERBOSE]   Frame: offset=0x{offset:x} dso={dso}", file=sys.stderr
+                )
+
+            # Resolve using the symbolizer backend
+            symbols = await self.symbolizer.resolve_address(dso, offset)
+
+            # Apply remappings and demangle
+            resolved_symbols = []
+            for symbol in symbols:
+                # Apply remappings
+                file_path = symbol["file"]
+                if file_path:
+                    for old, new in self.remappings:
+                        file_path = file_path.replace(old, new)
+
+                # Demangle symbol name
+                name = (
+                    await self._demangle_symbol(symbol["name"])
+                    if self.demangle
+                    else symbol["name"]
+                )
+
+                resolved_symbols.append(
+                    {"name": name, "file": file_path, "line": symbol["line"]}
+                )
+
+            frame_record = {
+                "offset": f"0x{offset:x}",
+                "dso": dso,
+                "symbols": resolved_symbols if resolved_symbols else None,
+            }
+            frames.append(frame_record)
+
+        sample_record = SampleOutput(
+            sample=self.sample_count,
+            comm=sample["comm"],
+            pid=sample["pid"],
+            frames=frames,
+        )
+        print(json.dumps(sample_record))
+
+    async def _output_sample_text(self, sample: Sample) -> None:
+        """Output sample in text format."""
+        for frame in sample["stack"]:
+            offset = frame["offset"]
+            dso = frame["dso"]
+
+            if self.verbose >= 2:
+                print(
+                    f"[VERBOSE]   Frame: offset=0x{offset:x} dso={dso}", file=sys.stderr
+                )
+
+            # Resolve using the symbolizer backend
+            symbols = await self.symbolizer.resolve_address(dso, offset)
+
+            # Apply remappings
+            for symbol in symbols:
+                if symbol["file"]:
+                    for old, new in self.remappings:
+                        symbol["file"] = symbol["file"].replace(old, new)
+
+            await self._output_text_frame(frame, symbols)
+
+    async def _output_text_frame(
+        self, frame: StackFrame, symbols: list[SymbolInfo]
     ) -> None:
-        """Output frame in JSON format"""
-        frames_json = []
-        for symbol in symbols:
-            name = (
-                await self._demangle_symbol(symbol["name"])
-                if self.demangle
-                else symbol["name"]
-            )
-            frames_json.append(
-                {"name": name, "file": symbol["file"], "line": symbol["line"]}
-            )
-
-        record = {
-            "sample": self.sample_count,
-            "comm": sample["comm"],
-            "pid": sample["pid"],
-            "offset": f"0x{frame['offset']:x}",
-            "dso": frame["dso"],
-            "frames": frames_json if frames_json else None,
-        }
-        print(json.dumps(record))
-
-    async def _output_text(self, frame: StackFrame, symbols: list[SymbolInfo]) -> None:
-        """Output frame in text format"""
+        """Output a single frame in text format."""
         if symbols:
             # Print first frame with address
             first_symbol = symbols[0]
@@ -842,7 +913,12 @@ class StreamingInlineResolver:
             if first_symbol["offset"] is not None:
                 first_line = f"{name} + {first_symbol['offset']} @ {first_symbol['file']}:{first_symbol['line']}"
             else:
-                first_line = f"{name} @ {first_symbol['file']}:{first_symbol['line']}"
+                if first_symbol["file"]:
+                    first_line = (
+                        f"{name} @ {first_symbol['file']}:{first_symbol['line']}"
+                    )
+                else:
+                    first_line = f"{name}"
 
             print(f"    0x{frame['offset']:x}: {first_line}")
 
@@ -857,7 +933,10 @@ class StreamingInlineResolver:
                 if symbol["offset"] is not None:
                     frame_line = f"{name} + {symbol['offset']} @ {symbol['file']}:{symbol['line']}"
                 else:
-                    frame_line = f"{name} @ {symbol['file']}:{symbol['line']}"
+                    if symbol["file"]:
+                        frame_line = f"{name} @ {symbol['file']}:{symbol['line']}"
+                    else:
+                        frame_line = f"{name}"
 
                 print(f"              {frame_line}")
         else:
